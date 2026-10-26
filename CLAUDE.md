@@ -27,6 +27,10 @@ done with the rigour of a bank's risk team.
 - `uv run pytest` (coverage on `src/` must stay >= 85 %)
 - `make check` runs all of the above; CI runs the same on every push.
 - Logic lives in `src/credit_risk_lab/`; notebooks only import it for exploration and figures.
+- Modules beyond the original plan: `selection.py` (IV/correlation/VIF filters), `eda.py`,
+  `plotting.py` (shared figure style, fixed CVD-safe palette), `reporting.py` (Markdown tables).
+- Each phase script writes its tables, figures and a `summary.md` under `reports/`; numbers
+  quoted anywhere else must come from those files.
 
 ## Data rules
 

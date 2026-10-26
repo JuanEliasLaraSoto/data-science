@@ -1,0 +1,4 @@
+model,cv_auc,best_params
+Decision tree,0.7417326656833615,"{'max_depth': 7, 'min_samples_leaf': 0.02}"
+Random forest,0.7747826753026515,"{'max_depth': 6, 'min_samples_leaf': 0.001}"
+Gradient boosting,0.7502597208268315,"{'learning_rate': 0.05, 'max_leaf_nodes': 7}"

@@ -1,7 +1,7 @@
 """Data acquisition, cleaning and sample splitting.
 
-Phase 0 implements data acquisition only:
-
+Sources
+-------
 * Lending Club accepted loans 2007-2018 (Kaggle ``wordsforthewise/lending-club``),
   downloaded through the public Kaggle REST API (v1) with the user's API token.
 * Macro series from FRED through the public ``fredgraph.csv`` endpoint, which
@@ -9,8 +9,20 @@ Phase 0 implements data acquisition only:
 * German Credit (OpenML ``credit-g``) as a fallback dataset. It has no dates, so
   it cannot support an out-of-time sample.
 
-Cleaning, target definition, removal of post-origination (leaky) fields and the
-train/test/out-of-time split are added in Phase 1.
+Lending Club sample design
+--------------------------
+* **Target.** ``1`` for ``Charged Off`` or ``Default``, ``0`` for ``Fully Paid``.
+  It is a lifetime (36-month) default flag. Unresolved loans (``Current``,
+  ``Late``, ``In Grace Period``) are dropped.
+* **Segment.** Individual applications for 36-month loans, issued under the
+  current credit policy. Loans flagged "Does not meet the credit policy" were
+  underwritten under older rules, and joint applications are a different
+  population.
+* **Maturity.** The development window and the out-of-time window only contain
+  vintages that have had 36 months to run off. Otherwise the "resolved" loans of
+  recent vintages would over-represent early defaults and early repayments.
+* **Leakage.** Every field known only after origination is dropped; see
+  :data:`LEAKAGE_COLUMNS` for the list and the reason for each.
 """
 
 from __future__ import annotations
@@ -18,9 +30,12 @@ from __future__ import annotations
 import base64
 import csv
 import gzip
+import hashlib
+import io
 import json
 import logging
 import os
+import tarfile
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -30,7 +45,10 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Final
 
+import numpy as np
+import pandas as pd
 from sklearn.datasets import fetch_openml
+from sklearn.model_selection import train_test_split
 
 logger = logging.getLogger(__name__)
 
@@ -343,8 +361,67 @@ def download_fred(
     return {sid: download_fred_series(sid, raw_dir, force=force) for sid in series_ids}
 
 
+# Fallback-of-the-fallback: the same UCI Statlog German Credit data (decoded labels)
+# shipped inside a pinned PyPI release of scorecardpy. Only the CSV is read from the
+# archive (nothing is executed) and its SHA-256 is checked.
+GERMAN_CREDIT_MIRROR_URL: Final = (
+    "https://files.pythonhosted.org/packages/56/5a/"
+    "7bae50d0875192a86d2153535fa221596c9f0c83b86dd7c25b005aa37de9/scorecardpy-0.1.9.7.tar.gz"
+)
+GERMAN_CREDIT_MIRROR_MEMBER: Final = "scorecardpy-0.1.9.7/scorecardpy/data/germancredit.csv"
+GERMAN_CREDIT_MIRROR_SHA256: Final = (
+    "2c0bae00275c028fc853a1ea72cc7a68002c3f6876c41300c5c948711540c8c6"
+)
+#: Mirror column names -> OpenML ``credit-g`` column names.
+GERMAN_CREDIT_MIRROR_COLUMNS: Final[Mapping[str, str]] = {
+    "status_of_existing_checking_account": "checking_status",
+    "duration_in_month": "duration",
+    "credit_history": "credit_history",
+    "purpose": "purpose",
+    "credit_amount": "credit_amount",
+    "savings_account_and_bonds": "savings_status",
+    "present_employment_since": "employment",
+    "installment_rate_in_percentage_of_disposable_income": "installment_commitment",
+    "personal_status_and_sex": "personal_status",
+    "other_debtors_or_guarantors": "other_parties",
+    "present_residence_since": "residence_since",
+    "property": "property_magnitude",
+    "age_in_years": "age",
+    "other_installment_plans": "other_payment_plans",
+    "housing": "housing",
+    "number_of_existing_credits_at_this_bank": "existing_credits",
+    "job": "job",
+    "number_of_people_being_liable_to_provide_maintenance_for": "num_dependents",
+    "telephone": "own_telephone",
+    "foreign_worker": "foreign_worker",
+    "creditability": "class",
+}
+
+
+def _german_credit_from_mirror(work_dir: Path) -> pd.DataFrame:
+    """Read German Credit from the pinned PyPI mirror and verify its checksum."""
+    archive = _download(_request(GERMAN_CREDIT_MIRROR_URL), work_dir / "mirror.tar.gz")
+    try:
+        with tarfile.open(archive, mode="r:gz") as tar:
+            member = tar.extractfile(GERMAN_CREDIT_MIRROR_MEMBER)
+            if member is None:
+                raise DataDownloadError(f"{GERMAN_CREDIT_MIRROR_MEMBER} is not a regular file.")
+            payload = member.read()
+    except (tarfile.TarError, KeyError) as exc:
+        raise DataDownloadError(f"Could not read {GERMAN_CREDIT_MIRROR_MEMBER}: {exc}") from exc
+    finally:
+        archive.unlink(missing_ok=True)
+    digest = hashlib.sha256(payload).hexdigest()
+    if digest != GERMAN_CREDIT_MIRROR_SHA256:
+        raise DataDownloadError(f"German Credit mirror checksum mismatch ({digest}).")
+    return pd.read_csv(io.BytesIO(payload)).rename(columns=GERMAN_CREDIT_MIRROR_COLUMNS)
+
+
 def download_german_credit(raw_dir: Path = RAW_DIR, *, force: bool = False) -> Path:
-    """Download German Credit (OpenML ``credit-g``, version 1) as a CSV fallback dataset.
+    """Download German Credit as a CSV fallback dataset, in the OpenML ``credit-g`` schema.
+
+    OpenML (``credit-g``, version 1) is the primary source. If it is unreachable,
+    the same UCI data are read from a pinned PyPI release (checksum-verified).
 
     Parameters
     ----------
@@ -370,11 +447,353 @@ def download_german_credit(raw_dir: Path = RAW_DIR, *, force: bool = False) -> P
             as_frame=True,
             data_home=str(target.parent / "openml_cache"),
         )
-    except (OSError, ValueError) as exc:
-        raise DataDownloadError(
-            f"Could not download OpenML '{OPENML_GERMAN_CREDIT}': {exc}. "
-            "Check that network access to www.openml.org and api.openml.org is allowed."
-        ) from exc
-    bunch.frame.to_csv(target, index=False)
-    logger.info("Saved German Credit (%d rows) to %s", len(bunch.frame), target)
+        frame, source = bunch.frame, "OpenML"
+    except (OSError, ValueError) as openml_error:
+        logger.warning("OpenML unreachable (%s); trying the PyPI mirror.", openml_error)
+        try:
+            frame, source = _german_credit_from_mirror(target.parent), "PyPI mirror"
+        except DataDownloadError as mirror_error:
+            raise DataDownloadError(
+                f"Could not download German Credit from OpenML ({openml_error}) nor from the "
+                f"PyPI mirror ({mirror_error}). Check network access to www.openml.org and "
+                "api.openml.org."
+            ) from mirror_error
+    frame.to_csv(target, index=False)
+    logger.info("Saved German Credit from %s (%d rows) to %s", source, len(frame), target)
     return target
+
+
+# ============================================================================ cleaning
+
+TARGET: Final = "target"
+VINTAGE: Final = "vintage"
+ISSUE_DATE: Final = "issue_d"
+LOAN_ID: Final = "id"
+META_COLUMNS: Final = (LOAN_ID, ISSUE_DATE, VINTAGE, TARGET)
+
+GOOD_STATUSES: Final = ("Fully Paid",)
+BAD_STATUSES: Final = ("Charged Off", "Default")
+POLICY_STATUS_PREFIX: Final = "Does not meet the credit policy"
+
+
+def _by_reason(groups: Mapping[str, Sequence[str]]) -> dict[str, str]:
+    return {column: reason for reason, columns in groups.items() for column in columns}
+
+
+#: Fields only known after origination: using them would leak the outcome.
+LEAKAGE_COLUMNS: Final[Mapping[str, str]] = _by_reason(
+    {
+        "Repayment performance observed after origination": (
+            "out_prncp",
+            "out_prncp_inv",
+            "total_pymnt",
+            "total_pymnt_inv",
+            "total_rec_prncp",
+            "total_rec_int",
+            "total_rec_late_fee",
+            "recoveries",
+            "collection_recovery_fee",
+            "last_pymnt_d",
+            "last_pymnt_amnt",
+            "next_pymnt_d",
+            "pymnt_plan",
+        ),
+        "Credit bureau data refreshed after origination": (
+            "last_credit_pull_d",
+            "last_fico_range_high",
+            "last_fico_range_low",
+        ),
+        "Hardship programme: only exists once the borrower is in difficulty": (
+            "hardship_flag",
+            "hardship_type",
+            "hardship_reason",
+            "hardship_status",
+            "deferral_term",
+            "hardship_amount",
+            "hardship_start_date",
+            "hardship_end_date",
+            "payment_plan_start_date",
+            "hardship_length",
+            "hardship_dpd",
+            "hardship_loan_status",
+            "orig_projected_additional_accrued_interest",
+            "hardship_payoff_balance_amount",
+            "hardship_last_payment_amount",
+        ),
+        "Debt settlement: only exists after charge-off or serious delinquency": (
+            "debt_settlement_flag",
+            "debt_settlement_flag_date",
+            "settlement_status",
+            "settlement_date",
+            "settlement_amount",
+            "settlement_percentage",
+            "settlement_term",
+        ),
+        "Funding outcome, determined after the credit decision": (
+            "funded_amnt",
+            "funded_amnt_inv",
+        ),
+    }
+)
+
+#: Fields known at origination but excluded from the candidate characteristics.
+EXCLUDED_COLUMNS: Final[Mapping[str, str]] = _by_reason(
+    {
+        "Lending Club's own risk grade and pricing: using it would make the scorecard "
+        "a recalibration of the incumbent model": ("grade", "sub_grade", "int_rate", "installment"),
+        "Identifier or free text": ("member_id", "url", "desc", "title", "emp_title"),
+        "Geography: proxy for protected characteristics (fair lending)": (
+            "zip_code",
+            "addr_state",
+        ),
+        "Platform decision, not an applicant characteristic": (
+            "initial_list_status",
+            "disbursement_method",
+            "policy_code",
+        ),
+        "Joint-application field (joint applications are outside the segment)": (
+            "annual_inc_joint",
+            "dti_joint",
+            "verification_status_joint",
+            "revol_bal_joint",
+            "sec_app_fico_range_low",
+            "sec_app_fico_range_high",
+            "sec_app_earliest_cr_line",
+            "sec_app_inq_last_6mths",
+            "sec_app_mort_acc",
+            "sec_app_open_acc",
+            "sec_app_revol_util",
+            "sec_app_open_act_il",
+            "sec_app_num_rev_accts",
+            "sec_app_chargeoff_within_12_mths",
+            "sec_app_collections_12_mths_ex_med",
+            "sec_app_mths_since_last_major_derog",
+        ),
+    }
+)
+
+#: Fields used to define the sample; constant (or the target) afterwards.
+SAMPLE_DEFINITION_COLUMNS: Final = ("loan_status", "term", "application_type")
+
+
+def exclusion_table() -> pd.DataFrame:
+    """Every dropped Lending Club field with its category and reason."""
+    rows = [
+        *({"column": c, "category": "leakage", "reason": r} for c, r in LEAKAGE_COLUMNS.items()),
+        *({"column": c, "category": "excluded", "reason": r} for c, r in EXCLUDED_COLUMNS.items()),
+    ]
+    return pd.DataFrame(rows)
+
+
+def load_lending_club(path: Path) -> pd.DataFrame:
+    """Read the accepted-loans file, skipping the leaky and excluded columns."""
+    header = pd.read_csv(path, nrows=0).columns
+    dropped = set(LEAKAGE_COLUMNS) | set(EXCLUDED_COLUMNS)
+    usecols = [c for c in header if c not in dropped]
+    return pd.read_csv(path, usecols=usecols, low_memory=False)
+
+
+def _parse_month(values: pd.Series) -> pd.Series:
+    """Parse Lending Club month strings such as ``"Dec-2015"``."""
+    return pd.to_datetime(values, format="%b-%Y", errors="coerce")
+
+
+def _parse_percent(values: pd.Series) -> pd.Series:
+    if pd.api.types.is_numeric_dtype(values):
+        return values.astype(float)
+    return pd.to_numeric(values.astype(str).str.strip().str.rstrip("%"), errors="coerce")
+
+
+def _emp_length_years(values: pd.Series) -> pd.Series:
+    """``"< 1 year"`` -> 0, ``"5 years"`` -> 5, ``"10+ years"`` -> 10, other -> NaN."""
+    text = values.astype(str)
+    years = pd.to_numeric(text.str.extract(r"(\d+)", expand=False), errors="coerce")
+    return years.where(~text.str.startswith("<"), 0.0)
+
+
+def engineer_lending_club_features(df: pd.DataFrame) -> pd.DataFrame:
+    """Derive application-time characteristics and drop their raw inputs.
+
+    * ``fico_score``: midpoint of the FICO range at application.
+    * ``credit_history_months``: months between the oldest credit line and issue.
+    * ``emp_length``: employment length in years (``10+`` capped at 10).
+    * ``loan_to_income``: requested amount over annual income.
+    """
+    out = df.copy()
+    if {"fico_range_low", "fico_range_high"} <= set(out.columns):
+        out["fico_score"] = (out["fico_range_low"] + out["fico_range_high"]) / 2
+        out = out.drop(columns=["fico_range_low", "fico_range_high"])
+    if "earliest_cr_line" in out.columns:
+        opened = _parse_month(out["earliest_cr_line"])
+        issued = out[ISSUE_DATE]
+        out["credit_history_months"] = (issued.dt.year - opened.dt.year) * 12 + (
+            issued.dt.month - opened.dt.month
+        )
+        out = out.drop(columns=["earliest_cr_line"])
+    if "emp_length" in out.columns:
+        out["emp_length"] = _emp_length_years(out["emp_length"])
+    if "revol_util" in out.columns:
+        out["revol_util"] = _parse_percent(out["revol_util"])
+    if {"loan_amnt", "annual_inc"} <= set(out.columns):
+        income = out["annual_inc"].where(out["annual_inc"] > 0)
+        out["loan_to_income"] = out["loan_amnt"] / income
+    return out
+
+
+def _log_step(log: list[dict[str, object]], step: str, frame: pd.DataFrame) -> None:
+    log.append({"step": step, "rows": len(frame)})
+
+
+def clean_lending_club(raw: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """Apply the segment filters, build the target and the characteristics.
+
+    Parameters
+    ----------
+    raw
+        Output of :func:`load_lending_club`.
+
+    Returns
+    -------
+    tuple
+        The modelling table (:data:`META_COLUMNS` plus candidate characteristics)
+        and a log with the number of rows after each filter.
+    """
+    log: list[dict[str, object]] = []
+    df = raw.copy()
+    _log_step(log, "Raw file", df)
+
+    status = df["loan_status"].astype(str)
+    df = df[~status.str.startswith(POLICY_STATUS_PREFIX)]
+    _log_step(log, "Exclude loans not meeting the current credit policy", df)
+
+    term = pd.to_numeric(df["term"].astype(str).str.extract(r"(\d+)", expand=False))
+    df = df[term == 36]
+    _log_step(log, "36-month term only", df)
+
+    if "application_type" in df.columns:
+        df = df[df["application_type"].astype(str).str.lower() == "individual"]
+        _log_step(log, "Individual applications only", df)
+
+    df = df.assign(**{ISSUE_DATE: _parse_month(df[ISSUE_DATE])})
+    df = df[df[ISSUE_DATE].notna()]
+    _log_step(log, "Valid issue date", df)
+
+    df = df[df["loan_status"].isin([*GOOD_STATUSES, *BAD_STATUSES])]
+    _log_step(log, "Resolved loans only (Fully Paid, Charged Off, Default)", df)
+
+    df = df.assign(
+        **{
+            TARGET: df["loan_status"].isin(BAD_STATUSES).astype(np.int64),
+            VINTAGE: df[ISSUE_DATE].dt.to_period("Q"),
+        }
+    )
+    df = engineer_lending_club_features(df)
+    df = df.drop(columns=[c for c in SAMPLE_DEFINITION_COLUMNS if c in df.columns])
+    features = [c for c in df.columns if c not in META_COLUMNS]
+    df = df[[c for c in META_COLUMNS if c in df.columns] + features].reset_index(drop=True)
+    return df, pd.DataFrame(log)
+
+
+def maturity_by_issue_year(raw: pd.DataFrame) -> pd.DataFrame:
+    """Share of resolved loans and default rate by issue year (36-month, current policy).
+
+    Shows which vintages have run off, and therefore which ones can be used
+    without maturity bias.
+    """
+    status = raw["loan_status"].astype(str)
+    term = pd.to_numeric(raw["term"].astype(str).str.extract(r"(\d+)", expand=False))
+    keep = ~status.str.startswith(POLICY_STATUS_PREFIX) & (term == 36)
+    frame = pd.DataFrame(
+        {
+            "year": _parse_month(raw.loc[keep, ISSUE_DATE]).dt.year,
+            "resolved": status[keep].isin([*GOOD_STATUSES, *BAD_STATUSES]),
+            "bad": status[keep].isin(BAD_STATUSES),
+        }
+    ).dropna(subset=["year"])
+    table = frame.groupby("year").agg(loans=("resolved", "size"), resolved=("resolved", "sum"))
+    table["resolved_share"] = table["resolved"] / table["loans"]
+    resolved = frame[frame["resolved"]]
+    table["default_rate_resolved"] = resolved.groupby("year")["bad"].mean()
+    table.index = table.index.astype(int)
+    return table
+
+
+#: German Credit fields excluded on fair-lending grounds.
+GERMAN_CREDIT_EXCLUDED: Final[Mapping[str, str]] = {
+    "personal_status": "Sex and marital status: protected characteristic",
+    "foreign_worker": "National origin: protected characteristic",
+}
+
+
+def clean_german_credit(raw: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """Build the modelling table for OpenML ``credit-g`` (target 1 = ``bad``)."""
+    log: list[dict[str, object]] = []
+    _log_step(log, "Raw file", raw)
+    df = raw.drop(columns=[c for c in GERMAN_CREDIT_EXCLUDED if c in raw.columns])
+    df[LOAN_ID] = np.arange(len(df))
+    df[TARGET] = (df["class"] == "bad").astype(np.int64)
+    df = df.drop(columns=["class"])
+    features = [c for c in df.columns if c not in META_COLUMNS]
+    _log_step(log, "Exclude protected characteristics", df)
+    return df[[LOAN_ID, TARGET, *features]], pd.DataFrame(log)
+
+
+# ============================================================================ split
+
+
+@dataclass(frozen=True)
+class SampleDesign:
+    """Development and out-of-time windows (inclusive, ``YYYY-MM``).
+
+    Development loans are split at random into train and test, stratified by
+    target and issue year. Out-of-time loans are never used for fitting.
+    """
+
+    dev_start: str = "2007-01"
+    dev_end: str = "2014-12"
+    oot_start: str = "2015-01"
+    oot_end: str = "2015-12"
+    test_size: float = 0.3
+    random_state: int = 42
+
+
+def _stratified_split(
+    df: pd.DataFrame, strata: pd.Series, test_size: float, random_state: int
+) -> tuple[pd.DataFrame, pd.DataFrame]:
+    if strata.value_counts().min() < 2:
+        strata = df[TARGET]
+    train, test = train_test_split(
+        df, test_size=test_size, stratify=strata, random_state=random_state
+    )
+    return train, test
+
+
+def split_sample(df: pd.DataFrame, design: SampleDesign | None = None) -> dict[str, pd.DataFrame]:
+    """Split into ``train``/``test`` (and ``oot`` when the data have issue dates).
+
+    Parameters
+    ----------
+    df
+        Modelling table from :func:`clean_lending_club` or :func:`clean_german_credit`.
+    design
+        Sample windows. Without issue dates only a stratified random split is made.
+
+    Returns
+    -------
+    dict
+        ``{"train": ..., "test": ..., "oot": ...}`` (``oot`` only with dates).
+    """
+    design = design or SampleDesign()
+    if ISSUE_DATE not in df.columns:
+        train, test = _stratified_split(df, df[TARGET], design.test_size, design.random_state)
+        return {"train": train, "test": test}
+
+    month = df[ISSUE_DATE].dt.to_period("M")
+    in_dev = (month >= pd.Period(design.dev_start, "M")) & (month <= pd.Period(design.dev_end, "M"))
+    in_oot = (month >= pd.Period(design.oot_start, "M")) & (month <= pd.Period(design.oot_end, "M"))
+    if (in_dev & in_oot).any():
+        raise ValueError("Development and out-of-time windows overlap.")
+    dev = df[in_dev]
+    strata = dev[TARGET].astype(str) + "_" + dev[ISSUE_DATE].dt.year.astype(str)
+    train, test = _stratified_split(dev, strata, design.test_size, design.random_state)
+    return {"train": train, "test": test, "oot": df[in_oot]}

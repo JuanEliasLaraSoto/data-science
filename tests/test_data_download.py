@@ -3,8 +3,10 @@
 from __future__ import annotations
 
 import gzip
+import hashlib
 import io
 import json
+import tarfile
 import urllib.error
 import urllib.request
 import zipfile
@@ -288,12 +290,63 @@ def test_download_german_credit(monkeypatch: pytest.MonkeyPatch, tmp_path: Path)
     assert len(calls) == 1
 
 
-def test_download_german_credit_network_error(
+def mirror_archive(csv_text: str) -> bytes:
+    payload = csv_text.encode()
+    buffer = io.BytesIO()
+    with tarfile.open(fileobj=buffer, mode="w:gz") as tar:
+        info = tarfile.TarInfo(data.GERMAN_CREDIT_MIRROR_MEMBER)
+        info.size = len(payload)
+        tar.addfile(info, io.BytesIO(payload))
+    return buffer.getvalue()
+
+
+MIRROR_CSV = (
+    "duration_in_month,personal_status_and_sex,creditability\n6,male : single,good\n48,female,bad\n"
+)
+
+
+def openml_blocked(**kwargs: Any) -> SimpleNamespace:
+    raise urllib.error.URLError("Tunnel connection failed: 403")
+
+
+def test_german_credit_falls_back_to_pypi_mirror(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
-    def failing_fetch_openml(**kwargs: Any) -> SimpleNamespace:
-        raise urllib.error.URLError("blocked")
+    monkeypatch.setattr(data, "fetch_openml", openml_blocked)
+    monkeypatch.setattr(
+        data, "GERMAN_CREDIT_MIRROR_SHA256", hashlib.sha256(MIRROR_CSV.encode()).hexdigest()
+    )
+    seen = install_urlopen(monkeypatch, mirror_archive(MIRROR_CSV))
+    path = data.download_german_credit(tmp_path)
+    frame = pd.read_csv(path)
+    assert list(frame.columns) == ["duration", "personal_status", "class"]
+    assert frame["class"].tolist() == ["good", "bad"]
+    assert seen[0].full_url == data.GERMAN_CREDIT_MIRROR_URL
+    assert sorted(p.name for p in path.parent.iterdir()) == ["credit_g.csv"]
 
-    monkeypatch.setattr(data, "fetch_openml", failing_fetch_openml)
-    with pytest.raises(data.DataDownloadError, match=r"api\.openml\.org"):
+
+def test_german_credit_mirror_checksum_mismatch(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    monkeypatch.setattr(data, "fetch_openml", openml_blocked)
+    install_urlopen(monkeypatch, mirror_archive(MIRROR_CSV + "tampered\n"))
+    with pytest.raises(data.DataDownloadError, match="checksum mismatch"):
+        data.download_german_credit(tmp_path)
+
+
+def test_german_credit_mirror_corrupt_archive(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    monkeypatch.setattr(data, "fetch_openml", openml_blocked)
+    install_urlopen(monkeypatch, b"not a tarball")
+    with pytest.raises(data.DataDownloadError, match="Could not read"):
+        data.download_german_credit(tmp_path)
+
+
+def test_german_credit_both_sources_blocked(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    monkeypatch.setattr(data, "fetch_openml", openml_blocked)
+    install_urlopen(monkeypatch, urllib.error.URLError("Tunnel connection failed: 403"))
+    with pytest.raises(data.DataDownloadError, match=r"nor from the PyPI mirror"):
         data.download_german_credit(tmp_path)

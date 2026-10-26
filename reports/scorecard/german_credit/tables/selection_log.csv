@@ -1,0 +1,11 @@
+feature,stage,decision,reason
+checking_status,iv,kept,"IV 0.6388 > 0.5; review: status of the applicant's checking account at application; known before the credit decision, so a strong but legitimate predictor"
+job,iv,dropped,IV 0.0156 < 0.02
+own_telephone,iv,dropped,IV 0.0029 < 0.02
+existing_credits,iv,dropped,IV 0.0022 < 0.02
+residence_since,iv,dropped,IV 0.0012 < 0.02
+num_dependents,iv,dropped,IV 0.0002 < 0.02
+other_parties,iv,dropped,IV 0.0000 < 0.02
+property_magnitude,logit,dropped,p-value 0.393 > 0.05
+age,logit,dropped,p-value 0.0758 > 0.05
+credit_amount,logit,dropped,p-value 0.0502 > 0.05
